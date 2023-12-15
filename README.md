@@ -1,3 +1,9 @@
+# About this fork
+
+The [rootless-docker](https://github.com/serokell/testcontainers-hs/tree/rootless-docker) branch adds support for the `DOCKER_HOST` env variable, allowing the docker socket to be located in places other than `/var/run/docker.sock`.
+
+**This fork is used by the JTX project.**
+
 # About
 
 Testcontainers is a Haskell library that provides a friendly API to run Docker
