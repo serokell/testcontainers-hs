@@ -65,6 +65,7 @@ module TestContainers.Docker
     -- * Referring to images
     ToImage,
     fromTag,
+    fromImageId,
     fromBuildContext,
     fromDockerfile,
     build,
@@ -75,12 +76,15 @@ module TestContainers.Docker
     -- * Running containers
     ContainerRequest,
     containerRequest,
+    withoutReaper,
     withLabels,
     setName,
     setFixedName,
     setSuffixedName,
     setRandomName,
     setCmd,
+    setMemory,
+    setCpus,
     setVolumeMounts,
     setRm,
     setEnv,
@@ -177,7 +181,8 @@ import Data.Aeson (decode')
 import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
-import Data.List (find)
+import Data.List (find, stripPrefix)
+import Data.Maybe (fromMaybe)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -200,8 +205,9 @@ import Network.HTTP.Types (statusCode)
 import qualified Network.Socket as Socket
 import Optics.Fold (pre)
 import Optics.Operators ((^?))
-import Optics.Optic ((%))
+import Optics.Optic ((%), (<&>))
 import System.Directory (doesFileExist)
+import System.Environment (lookupEnv)
 import System.IO (Handle, hClose)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Process as Process
@@ -218,6 +224,7 @@ import TestContainers.Docker.Internal
     InspectOutput,
     LogConsumer,
     Pipe (..),
+    WithoutReaper (..),
     consoleLogConsumer,
     docker,
     dockerFollowLogs,
@@ -272,6 +279,8 @@ data ContainerRequest = ContainerRequest
     volumeMounts :: [(Text, Text)],
     network :: Maybe (Either Network Text),
     networkAlias :: Maybe Text,
+    cpus :: Maybe Text,
+    memory :: Maybe Text,
     links :: [ContainerId],
     naming :: NamingStrategy,
     rmOnExit :: Bool,
@@ -281,6 +290,9 @@ data ContainerRequest = ContainerRequest
     followLogs :: Maybe LogConsumer,
     workDirectory :: Maybe Text
   }
+
+instance WithoutReaper ContainerRequest where
+  withoutReaper request = request {noReaper = True}
 
 -- | Parameters for a naming a Docker container.
 --
@@ -304,6 +316,8 @@ containerRequest image =
       volumeMounts = [],
       network = Nothing,
       networkAlias = Nothing,
+      memory = Nothing,
+      cpus = Nothing,
       links = [],
       rmOnExit = False,
       readiness = mempty,
@@ -355,6 +369,22 @@ setSuffixedName preffix req =
 setCmd :: [Text] -> ContainerRequest -> ContainerRequest
 setCmd newCmd req =
   req {cmd = Just newCmd}
+
+-- | Set the memory limit of a Docker container. This is equivalent to
+-- invoking @docker run@ with the @--memory@ parameter.
+--
+-- @since x.x.x.x
+setMemory :: Text -> ContainerRequest -> ContainerRequest
+setMemory newMemory req =
+  req {memory = Just newMemory}
+
+-- | Set the cpus limit of a Docker container. This is equivalent to
+-- invoking @docker run@ with the @--cpus@ parameter.
+--
+-- @since x.x.x.x
+setCpus :: Text -> ContainerRequest -> ContainerRequest
+setCpus newCpus req =
+  req {cpus = Just newCpus}
 
 -- | The volume mounts to link to Docker container. This is the equivalent
 -- of passing the command on the @docker run -v@ invocation.
@@ -518,6 +548,8 @@ run request = do
           volumeMounts,
           network,
           networkAlias,
+          memory,
+          cpus,
           links,
           rmOnExit,
           readiness,
@@ -562,6 +594,8 @@ run request = do
             ++ [["--volume", src <> ":" <> dest] | (src, dest) <- volumeMounts]
             ++ [["--rm"] | rmOnExit]
             ++ [["--workdir", workdir] | Just workdir <- [workDirectory]]
+            ++ [["--memory", value] | Just value <- [memory]]
+            ++ [["--cpus", value] | Just value <- [cpus]]
             ++ [[tag]]
             ++ [command | Just command <- [cmd]]
 
@@ -603,11 +637,19 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
+  dockerSocketLocation <-
+    liftIO $
+      lookupEnv "DOCKER_HOST"
+        <&> (>>= stripPrefix "unix://")
+        <&> fromMaybe "/var/run/docker.sock"
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
-        & skipReaper
-        & setVolumeMounts [("/var/run/docker.sock", "/var/run/docker.sock")]
+        &
+        -- Ryuk destroys itself once it reaped the resources,
+        -- no need to register itself with itself.
+        withoutReaper
+        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
         & setExpose [ryukPort]
         & setWaitingFor (waitUntilMappedPortReachable ryukPort)
         & setRm True
@@ -616,14 +658,6 @@ createRyukReaper = do
         containerAddress ryukContainer ryukPort
 
   newRyukReaper ryukContainerAddress ryukContainerPort
-
--- | Internal attribute, serving as a loop breaker: When runnign a container
--- we ensure a 'Reaper' is present, since the 'Reaper' itself is a running
--- container we need to break the loop to avoid spinning up a new 'Reaper' for
--- the 'Reaper'.
-skipReaper :: ContainerRequest -> ContainerRequest
-skipReaper request =
-  request {noReaper = True}
 
 -- | Kills a Docker container. `kill` is essentially @docker kill@.
 --
@@ -713,7 +747,7 @@ defaultToImage action =
     { runToImage = action
     }
 
--- | Get an `Image` from a tag.
+-- | Get an `Image` from a tag. This runs @docker pull --quiet <tag>@ to obtain an image id.
 --
 -- @since 0.1.0.0
 fromTag :: ImageTag -> ToImage
@@ -724,6 +758,15 @@ fromTag tag = defaultToImage $ do
     Image
       { tag = strip (pack output)
       }
+
+-- | Get an `Image` from an image id. This doesn't run @docker pull@ or any other Docker command
+-- on construction.
+--
+-- @since x.x.x.x
+fromImageId :: Text -> ToImage
+fromImageId imageId =
+  defaultToImage $
+    pure Image {tag = imageId}
 
 -- | Build the image from a build path and an optional path to the
 -- Dockerfile (default is Dockerfile)
@@ -1102,8 +1145,8 @@ internalContainerIp :: Container -> Text
 internalContainerIp Container {id, inspectOutput} =
   case inspectOutput
     ^? Optics.key "NetworkSettings"
-    % Optics.key "IPAddress"
-    % Optics._String of
+      % Optics.key "IPAddress"
+      % Optics._String of
     Nothing ->
       throw $ InspectOutputUnexpected {id}
     Just address ->
