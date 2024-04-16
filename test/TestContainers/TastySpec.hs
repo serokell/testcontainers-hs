@@ -73,7 +73,7 @@ containers1 = do
   _jaeger <-
     run $
       containerRequest (fromTag "jaegertracing/all-in-one:1.6")
-        & setExpose ["5775/udp", "6831/udp", "6832/udp", "5778", "16686/tcp"]
+        & setExpose ["5775/udp", "6831/udp", "::6832/udp", "5778:5778", "127.0.0.1:16686:16686/tcp"]
         & withNetwork net
         & setWaitingFor
           (waitForHttp "16686/tcp" "/" [200])

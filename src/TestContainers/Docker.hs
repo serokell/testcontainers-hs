@@ -275,7 +275,7 @@ data ContainerRequest = ContainerRequest
   { toImage :: ToImage,
     cmd :: Maybe [Text],
     env :: [(Text, Text)],
-    exposedPorts :: [Port],
+    exposedPorts :: [PortExpose],
     volumeMounts :: [(Text, Text)],
     network :: Maybe (Either Network Text),
     networkAlias :: Maybe Text,
@@ -508,6 +508,58 @@ instance IsString Port where
     _ ->
       Prelude.error ("invalid port literal: " <> input)
 
+-- | Definition of port expose option for 'docker run'
+--
+-- @since x.x.x.x
+data PortExpose = PortExpose
+  { hostIp :: Text,
+    hostPort :: Maybe Int,
+    containerPort :: Port
+  }
+  deriving stock (Eq, Ord)
+
+-- @since 0.5.0.0
+instance Show PortExpose where
+  show PortExpose {hostIp, hostPort, containerPort} =
+    unpack hostIp <> ":" <> maybe "" show hostPort <> ":" <> show containerPort
+
+-- | A cursed but handy instance supporting literal 'PortExpose's.
+--
+-- @since x.x.x.x
+-- This instance is mostly added for backward compatibility in @setExpose@ function.
+instance Num PortExpose where
+  fromInteger x =
+    PortExpose { hostIp = "", hostPort = Nothing, containerPort = fromInteger x }
+  (+) = Prelude.error "not implemented"
+  (*) = Prelude.error "not implemented"
+  abs = Prelude.error "not implemented"
+  signum = Prelude.error "not implemented"
+  negate = Prelude.error "not implemented"
+
+-- | A cursed but handy instance supporting literal 'PortExpose's of them
+-- form @<Port>@, @"8080:<Port>"@, @"127.0.0.1:8080:<Port>"@.
+--
+-- @since x.x.x.x
+instance IsString PortExpose where
+  fromString input = case splitOn ":" (pack input) of
+    -- "-p 8080/tcp"
+    [containerPort] ->
+      PortExpose { hostIp = "", hostPort = Nothing, containerPort = fromString $ unpack containerPort}
+    -- "-p 8080:8080/tcp", host port might be empty
+    [hostPort, containerPort] ->
+      PortExpose { hostIp = "", hostPort = extractPort hostPort, containerPort = fromString $ unpack containerPort}
+    [hostIp, hostPort, containerPort] ->
+      PortExpose { hostIp = hostIp, hostPort = extractPort hostPort, containerPort = fromString $ unpack containerPort}
+    -- "-p 127.0.0.1:8080:8080/tcp", host IP and port might be empty
+    _ -> Prelude.error ("invalid port expose literal: " <> input)
+    where
+      extractPort s = case s of
+        "" -> Nothing
+        _ -> case decimal s of
+          Right (port, "") -> Just port
+          _ -> Prelude.error $ "invalid port literal: " <> unpack s
+
+
 -- | Set exposed ports on the container. This is equivalent to setting @--publish $PORT@ to
 -- @docker run@. Docker assigns a random port for the host port. You will have to use `containerIp`
 -- and `containerPort` to connect to the published port.
@@ -519,7 +571,7 @@ instance IsString Port where
 -- @
 --
 -- @since 0.1.0.0
-setExpose :: [Port] -> ContainerRequest -> ContainerRequest
+setExpose :: [PortExpose] -> ContainerRequest -> ContainerRequest
 setExpose newExpose req =
   req {exposedPorts = newExpose}
 
@@ -586,7 +638,7 @@ run request = do
             ++ [["--name", containerName] | Just containerName <- [name]]
             ++ [["--label", label <> "=" <> value] | (label, value) <- additionalLabels ++ labels]
             ++ [["--env", variable <> "=" <> value] | (variable, value) <- env]
-            ++ [["--publish", pack (show port) <> "/" <> protocol] | Port {port, protocol} <- exposedPorts]
+            ++ [["--publish", pack $ show portExpose] | portExpose <- exposedPorts]
             ++ [["--network", networkName] | Just (Right networkName) <- [network]]
             ++ [["--network", networkId dockerNetwork] | Just (Left dockerNetwork) <- [network]]
             ++ [["--network-alias", alias] | Just alias <- [networkAlias]]
@@ -1197,27 +1249,29 @@ containerGateway Container {id, inspectOutput} =
     Just gatewayIp ->
       gatewayIp
 
--- | Looks up an exposed port on the host.
+-- | Looks up an exposed port and IP on the host.
 --
--- @since 0.1.0.0
-containerPort :: Container -> Port -> Int
-containerPort Container {id, inspectOutput} Port {port, protocol} =
+-- @since x.x.x.x
+containerIpAndPort :: Container -> Port -> (Text, Int)
+containerIpAndPort Container {id, inspectOutput} Port {port, protocol} =
   let -- TODO also support UDP ports
       -- Using IsString so it works both with Text (aeson<2) and Aeson.Key (aeson>=2)
       textPort :: (IsString s) => s
       textPort = fromString $ show port <> "/" <> unpack protocol
-   in -- TODO be more mindful, make sure to grab the
-      -- port from the right host address
 
-      case inspectOutput
+      extractNetworkSettingsFiels field = inspectOutput
         ^? pre
           ( Optics.key "NetworkSettings"
               % Optics.key "Ports"
               % Optics.key textPort
               % Optics.values
-              % Optics.key "HostPort"
+              % Optics.key field
               % Optics._String
-          ) of
+          )
+   in -- TODO be more mindful, make sure to grab the
+      -- port from the right host address
+
+      case extractNetworkSettingsFiels "HostPort" of
         Nothing ->
           throw $
             UnknownPortMapping
@@ -1225,7 +1279,7 @@ containerPort Container {id, inspectOutput} Port {port, protocol} =
                 port = textPort
               }
         Just hostPort ->
-          read (unpack hostPort)
+          (fromMaybe "localhost" (extractNetworkSettingsFiels "HostIp"), read (unpack hostPort))
 
 -- | Returns the domain and port exposing the given container's port. Differs
 -- from 'containerPort' in that 'containerAddress' will return the container's
@@ -1238,7 +1292,7 @@ containerAddress container Port {port, protocol} =
   let inDocker = unsafePerformIO isRunningInDocker
    in if inDocker
         then (containerAlias container, port)
-        else ("localhost", containerPort container (Port {port, protocol}))
+        else containerIpAndPort container (Port {port, protocol})
 
 -- | Runs the `docker inspect` command. Memoizes the result.
 --
